@@ -36,6 +36,8 @@ use IPC::Run qw( run ); #interact with processes
 ################################################################################
 # set text variables
 our $check_ipmi_sensor_version = "3.7";
+our $PAT_INT = "[-+]?_*[0-9][0-9_]*";
+our $PAT_FLOAT = "[-+]?[0-9_]+(\.[0-9_]+)?([eE][-+]?[0-9_]+)?";
 
 sub get_version
 {
@@ -49,10 +51,11 @@ sub get_usage
 {
 	return <<EOT;
 Usage:
-check_ipmi_sensor -H <hostname>
+check_ipmi_sensor [-H <hostname>]
   [-f <FreeIPMI config file> | -U <username> -P <password> -L <privilege level>]
   [-O <FreeIPMI options>] [-b] [-T <sensor type>] [-x <sensor id>]
   [-i <sensor id>] [-o zenoss] [-D <protocol LAN version>] [-h] [-V]
+  [-w <num. value>] [-c <num. value>] [-min <num. value>] [-max <num. value>]
   [-v|-vv|-vvv]
 EOT
 }
@@ -107,6 +110,18 @@ sub get_help
        specific sensors should be monitored. Be aware that only for the
        specified sensor errors/warnings are generated. Use -vvv option to query
        the <sensor ids>.
+  [-w <numeric value>]
+       senor warning level for numeric sensors. Requires -i. For multiple 
+       sensors the order much match that of -i <sensor id> order.
+  [-c <numeric value>]
+       senor critical level for numeric sensors. Requires -i. For multiple 
+       sensors the order much match that of -i <sensor id> order.
+  [-min <numeric value>]
+       senor minimum output level for numeric sensors. Requires -i. For multiple 
+       sensors the order much match that of -i <sensor id> order.
+  [-max <numeric value>]
+       senor maximum output level for numeric sensors. Requires -i. For multiple 
+       sensors the order much macth that of -i <sensor id> order.       			         
   [-v|-vv|-vvv]
        be verbose
          (no -v) .. single line output
@@ -130,8 +145,8 @@ sub get_help
        print the product serial number if it is available in the IPMI FRU data.
        For this purpose the tool 'ipmi-fru' is used. E.g.:
          IPMI Status: OK (9000096781)
-  [--nosel]
-       turn off system event log checking via ipmi-sel.
+  [--sel]
+       also check system event log via ipmi-sel.
   [--nosudo]
        turn off sudo usage on localhost or if ipmi host is ommited.
   [--nothresholds]
@@ -143,15 +158,15 @@ sub get_help
 
 Examples:
   \$ check_ipmi_sensor -H 192.0.2.1 -U monitor -P monitor -L user 
-    IPMI Status: OK | 'System Temp'=30.00 'Peripheral Temp'=32.00
+    IPMI Status: OK|'System Temp'=30.00 'Peripheral Temp'=32.00
     'FAN 1'=2775.00 [...]
   \$ check_ipmi_sensor -H 192.0.2.1 -U monitor -P monitor -L user -x 205
-    IPMI Status: OK | 'System Temp'=30.00 'Peripheral Temp'=32.00 
+    IPMI Status: OK|'System Temp'=30.00 'Peripheral Temp'=32.00 
     'FAN 2'=2775.00 [...]
   \$ check_ipmi_sensor -H 192.0.2.1 -U monitor -P monitor -L user -i 4,71
-    IPMI Status: OK | 'System Temp'=30.00 'Peripheral Temp'=32.00
+    IPMI Status: OK|'System Temp'=30.00 'Peripheral Temp'=32.00
   \$ check_ipmi_sensor -H 192.0.2.1 -U monitor -P monitor -L user -i 4 --fru
-    IPMI Status: OK (0000012345) | 'System Temp'=30.00
+    IPMI System Temp: OK = 30 C (0000012345)|'System Temp'=30[C];15;53;5:65
 
 Further information about this plugin can be found at
 http://www.thomas-krenn.com/en/wiki/IPMI_Sensor_Monitoring_Plugin
@@ -319,6 +334,122 @@ sub parse_sel{
 	return \@sel_rows;
 }
 
+sub get_sensor_idx{ # (include_list : array, sensor_id : int)
+	my @ilist = @{$_[0]};
+	my $sensor_id = $_[1];
+	my $idx;
+	for (my $i=0;$i < @ilist;$i++){
+		if ($ilist[$i] == $sensor_id){
+			$idx = $i;
+			last;
+		}
+	}
+	return $idx; # Undefined if not found
+}
+
+sub interpret_ipmi_state{ # (ipmistate : str)
+	my $ipmistate = $_[0];
+	my %state = (
+    "state" => "Unknown",
+    "exit" => 3,
+    );
+						
+	if ($ipmistate eq "Nominal"){
+		$state{'state'} = "OK";
+		$state{'exit'} = 0;	
+	} 					
+	elsif ($ipmistate eq "Warning"){
+		$state{'state'} = "Warning";
+		$state{'exit'} = 1;					
+	}
+	elsif ($ipmistate eq "Critical"){
+		$state{'state'} = "Critical";
+		$state{'exit'} = 2;	
+	}
+	return \%state;
+}
+
+sub interpret_range{ # (range : str)
+	my $txtrange = $_[0];
+	my %range;
+	my $negate;
+	($negate,$range{'low'},undef,$range{'high'}) = $txtrange =~ /^(@)?(~|-?\d*(\.\d+)?|):(~|-?\d*(\.\d+)?|)$/;
+	if ((defined $negate) && ($negate eq "@")){ $range{'negate'} = 1; }
+	else { $range{'negate'} = 0; }
+	if (($range{'low'}) || ($range{'high'})){
+		$range{'low'} = "~" if ($range{'low'} eq "");
+		$range{'high'} = "~" if ($range{'high'} eq "");
+	}
+	elsif ($txtrange =~ m/^\d+(\.\d+)?$/){
+		if ($txtrange >= 0){
+			$range{'low'} = 0;
+			$range{'high'} = $txtrange;
+		}
+		else{
+			$range{'low'} = $txtrange;
+			$range{'high'} = 0;
+		}
+	}
+	else{
+		print "Error: Illegal range \"$txtrange\"";
+		exit(3);
+	}
+	return \%range;
+}
+
+sub interpret_ipmi_range{ # (lower, upper : str)
+	my $lower = $_[0];
+	my $upper = $_[1];
+	my %range;
+	$range{'negate'} = 0;
+	if ($lower eq "N/A") { $range{'low'} = "~"; }
+	else { $range{'low'} = $lower; }
+	if ($upper eq "N/A") { $range{'high'} = "~"; }
+	else { $range{'high'} = $upper; }
+	if (($range{'low'} eq "~") && ($range{'high'} eq "~")) { return undef; }
+	else { return \%range; }
+}
+
+sub in_range{ # (range : hashref, value : real)
+	my $range = $_[0];
+	my $value = $_[1];
+	my $ret = 0; # starting out with false
+	if ($range->{'negate'}){
+		if (($range->{'low'} eq "~") && ($range->{'high'} eq "~")) {}
+		elsif ($range->{'low'} eq "~"){
+			$ret = 1 if ($value > $range->{'high'});
+		}
+		elsif ($range->{'high'} eq "~"){
+			$ret = 1 if ($value < $range->{'low'});
+		}
+		else{
+			$ret = 1 if (($value > $range->{'high'}) || ($value < $range->{'low'}));
+		}
+	}
+	else{
+		if (($range->{'low'} eq "~") && ($range->{'high'} eq "~")) { $ret = 1; }
+		elsif ($range->{'low'} eq "~"){
+			$ret = 1 if ($value <= $range->{'high'});
+		}
+		elsif ($range->{'high'} eq "~"){
+			$ret = 1 if ($value >= $range->{'low'});
+		}
+		else{
+			$ret = 1 if (($value <= $range->{'high'}) && ($value >= $range->{'low'}));
+		}
+	}
+	return $ret;
+}
+
+sub range2txt{ # (range : hashref)	
+	my $range = $_[0];
+	my $txt;
+	if ($range->{'negate'}){ $txt = "@";}
+	else{ $txt = "";}
+	$txt .= $range->{'low'}.":".$range->{'high'}; # is it better to return "10: " than "10:~"? If so this line need to change and substitute space for ~.
+	return $txt;
+}
+
 #define entire hashes
 our %hdrmap = (
 	'Record_ID'		=> 'id',	# FreeIPMI ...,0.7.x
@@ -352,14 +483,14 @@ MAIN: {
 	my ($ipmi_host, $ipmi_user, $ipmi_password, $ipmi_privilege_level, $ipmi_config_file, $ipmi_outformat);
 	my (@freeipmi_options, $freeipmi_compat);
 	my (@ipmi_sensor_types, @ipmi_xlist, @ipmi_ilist);
-	my (@ipmi_version);
+	my (@ipmi_version, @wlist, @clist, @minlist, @maxlist);
 	my $ipmi_sensors = 0;#states to use ipmi-sensors instead of ipmimonitoring
 	my $fan_count;#number of fans that should be installed in unit
 	my $lanVersion;#if desired use a different protocol version
 	my $abort_text = '';
 	my $zenoss = 0;
 	my $simulate = '';
-	my ($use_fru, $no_sel, $no_sudo, $use_thresholds, $no_thresholds);
+	my ($use_fru, $use_sel, $no_sudo, $use_thresholds, $no_thresholds);
 
 	#read in command line arguments and init hash variables with the given values from argv
 	if ( !( GetOptions(
@@ -372,7 +503,8 @@ MAIN: {
 		'b|compat'			=> \$freeipmi_compat,
 		'T|sensor-types=s'	=> \@ipmi_sensor_types,
 		'fru'				=> \$use_fru,
-		'nosel'				=> \$no_sel,
+		'nosel'				=> sub{},
+		'sel'				=> \$use_sel,
 		'nosudo'			=> \$no_sudo,
 		'nothresholds'			=> \$no_thresholds,
 		'v|verbosity'		=> \$verbosity,
@@ -380,6 +512,10 @@ MAIN: {
 		'vvv'				=> sub{$verbosity=3},
 		'x|exclude=s'		=> \@ipmi_xlist,
 		'i|include=s'		=> \@ipmi_ilist,
+		'w|warning=s'		=> \@wlist,
+		'c|critical=s'	=> \@clist,
+		'min=s'						=> \@minlist,
+		'max=s'						=> \@maxlist,
 		'o|outformat=s'		=> \$ipmi_outformat,
 		'fc|fancount=i'		=> \$fan_count,
 		'D=s'				=> \$lanVersion,
@@ -390,7 +526,7 @@ MAIN: {
 				print STDOUT get_usage();
 				print STDOUT "\n";
 				print STDOUT get_help();
-				exit(0)
+				exit(3)
 			},
 		'V|version'			=>
 			sub{
@@ -402,11 +538,12 @@ MAIN: {
 				exit(3);
 			}
 	) ) ){
-		usage(1);#call usage if GetOptions failed
+		usage(3);#call usage if GetOptions failed
 	}
-	usage(1) if @ARGV;#print usage if unknown arg list is left
+	usage(3) if @ARGV;#print usage if unknown arg list is left
 
-################################################################################
+################################################################################	@minlist = split(/,/, join(',', @minlist));
+
 # check for ipmimonitoring or ipmi-sensors. Since version > 0.8 ipmi-sensors is used
 # if '--legacy-output' is given ipmi-sensors cannot be used
 	if( $MISSING_COMMAND_TEXT ne "" ){
@@ -442,6 +579,10 @@ MAIN: {
 	@ipmi_sensor_types = split(/,/, join(',', @ipmi_sensor_types));
 	@ipmi_xlist = split(/,/, join(',', @ipmi_xlist));
 	@ipmi_ilist = split(/,/, join(',', @ipmi_ilist));
+	@wlist = split(/,/, join(',', @wlist));
+	@clist = split(/,/, join(',', @clist));
+	@minlist = split(/,/, join(',', @minlist));
+	@maxlist = split(/,/, join(',', @maxlist));
 
 	#check for zenoss output
 	if(defined $ipmi_outformat && $ipmi_outformat eq "zenoss"){
@@ -475,6 +616,64 @@ MAIN: {
 			exit(3);
 		}
 	}
+	# Checks for -w, -c, -min and -max options
+	if ((@wlist) || (@clist) || (@minlist) || (@maxlist)){ 
+		if (!@ipmi_ilist){
+			$abort_text .= "-i <sensor id(s)> must be specified when -w, -c, -min or -max is used. ";
+		}
+		if (@ipmi_xlist){
+			$abort_text .= "-x <sensor id> cannot be used with -w, -c, -min or -max options. ";
+		}
+		if (@ipmi_sensor_types){
+			$abort_text .= "Sensor type filtering (-T) cannot be used with -w, -c, -min or -max options. ";
+		}
+			
+		for (my $i=0; $i < @ipmi_ilist; $i++){
+			if (($i < @minlist - 1) && ($i < @maxlist - 1)){
+				if ((defined $maxlist[$i]) && (!defined $minlist[$i])){				
+					if ($maxlist[$i] >= 0){
+						$minlist[$i] = 0;
+					}
+					else{
+						if (@ipmi_ilist > 1){
+							$abort_text .= "-min must be specified when -max is negative for sensor id ".$ipmi_ilist[$i].". ";					
+						}
+						else{
+							$abort_text .= "-min must be specified when -max is negative. ";
+						}
+					}
+				}
+				if ((defined $minlist[$i]) && (!defined $maxlist[$i])){
+					if ($minlist[$i] <= 0){
+						$maxlist[$i] = 0;
+					}
+					else{
+						if (@ipmi_ilist > 1){
+							$abort_text .= "-max must be specified when -min is positive for sensor id ".$ipmi_ilist[$i].". ";			
+
+						}
+						else{
+							$abort_text .= "-max must be specified when -min is positive. ";			
+						}
+					}
+				}
+			}
+		}
+	}
+	# Checks for -sel
+	if ($use_sel){
+		if (@ipmi_ilist){
+			$abort_text .= "-i <sensor id(s)> and -sel cannot be combined. ";
+		}
+		if (@ipmi_xlist){
+			$abort_text .= "-x <sensor id(s)> and -sel cannot be combined. ";
+		}
+	}
+	if( $abort_text ne ""){
+		print STDOUT "Error: " . $abort_text ."\n";
+		exit(3);
+	}
+		
 	# copy command for fru usage
 	my @frucmd;
 	if($use_fru){
@@ -485,6 +684,7 @@ MAIN: {
 	# , is the seperator in the new string
 	if(@ipmi_sensor_types){
 		push @basecmd, '-g', join(',', @ipmi_sensor_types);
+		push @selcmd, '--sensor-types', join(',', @ipmi_sensor_types);
 	}
 	if(@freeipmi_options){
 		push @basecmd, @freeipmi_options;
@@ -516,7 +716,7 @@ MAIN: {
 	}
 	if($lanVersion ne 'default' && defined $ipmi_host && $ipmi_host ne 'localhost'){
 		push @getstatus, "--driver-type=$lanVersion";
-		if(!$no_sel){
+		if($use_sel){
 			push @selcmd, "--driver-type=$lanVersion";
 		}
 		if($use_fru){
@@ -525,6 +725,14 @@ MAIN: {
 	}
 	if($use_thresholds && !$no_thresholds){
 		push @getstatus, '--output-sensor-thresholds';
+	}
+	#if include list is specified, fetch only those sensors (increases speed in some circumstances)
+	if (@ipmi_ilist){
+		push @getstatus, "--record-ids=".join(",",@ipmi_ilist);
+	}
+	#exclude members of exclude list is specified
+	if (@ipmi_xlist){
+		push @getstatus, "--exclude-record-ids=".join(",",@ipmi_xlist);
 	}
 
 ################################################################################
@@ -547,7 +755,7 @@ MAIN: {
 		@fruoutput = get_fru(\@frucmd, $verbosity);
 	}
 	my $seloutput;
-	if(!$no_sel){
+	if($use_sel){
 		$seloutput = parse_sel(\@selcmd, $verbosity);
 	}
 ################################################################################
@@ -592,13 +800,6 @@ MAIN: {
 			print "   ", join(' ', @getstatus), "\n";
 			exit(3);
 		}
-		#print desired filter types
-		if ( @ipmi_sensor_types ){
-			print "Sensor Type(s) ", join(', ', @ipmi_sensor_types), " Status: ";
-		}
-		else{
-			print "IPMI Status: ";
-		}
 		#split at newlines, fetch array with lines of output
 		my @ipmioutput = split('\n', $ipmioutput);
 		
@@ -611,10 +812,17 @@ MAIN: {
 		#shift out the header as it is the first line
 		my $header = shift @ipmioutput;
 		if(!defined($header)){
-			print "$ipmioutput\n";
-			print " FreeIPMI returned an empty header map (first line)";
-			if(@ipmi_sensor_types){
-				print " FreeIPMI could not find any sensors for the given sensor type (option '-T').\n";
+			print "$ipmioutput\n" if ($ipmioutput);
+			if((@ipmi_ilist) || (@ipmi_sensor_types) || (@ipmi_xlist)){
+				print " FreeIPMI couln't find any sensors for the given filters: ";
+				my @filterlist;
+				push @filterlist,join "","include id",@ipmi_ilist > 1 ? "s " : " ",join(",",@ipmi_ilist) if (@ipmi_ilist);
+				push @filterlist,join "","exclude id",@ipmi_xlist > 1 ? "s " : " ",join(",",@ipmi_xlist) if (@ipmi_xlist);
+				push @filterlist,join "","sensor type",@ipmi_sensor_types > 1 ? "s " : " ",join(",",@ipmi_sensor_types) if (@ipmi_sensor_types);
+				print join(", ",@filterlist),"\n";
+			}
+			else{
+				print " FreeIPMI returned an empty header map (first line)\n";
 			}
 			exit(3);
 		}
@@ -638,107 +846,153 @@ MAIN: {
 		#create hash with sensor name an 1
 		my %ipmi_xlist = map { ($_, 1) } @ipmi_xlist;
 		#filter out the desired sensor values
-		@ipmioutput2 = grep(!exists $ipmi_xlist{$_->{'id'}}, @ipmioutput2);
+		@ipmioutput2 = grep(!exists $ipmi_xlist{$_->{'id'}}, @ipmioutput2); # Are these needed when filtering is done by ipmi-sensors?
 		#check for an include list
-		if(@ipmi_ilist){
+		if(@ipmi_ilist){                                                    # Are these needed when filtering is done by ipmi-sensors?
 			my %ipmi_ilist = map { ($_, 1) } @ipmi_ilist;
 			#only include sensors from include list
 			@ipmioutput2 = grep(exists $ipmi_ilist{$_->{'id'}}, @ipmioutput2);
 		}
+		#print desired filter types
+		if ( @ipmi_sensor_types ){
+			print "Sensor Type",@ipmi_sensor_types > 1 ? "s" : ""," ", join(', ', @ipmi_sensor_types), " Status: ";
+		}
+		elsif (@ipmi_ilist == 1){
+			print "IPMI ",$ipmioutput2[0]->{'name'},": ";
+		}
+		else{
+			print "IPMI Status: ";
+		}
+		
 		#start with main output
 		my $exit = 0;
-		my $w_sensors = '';#sensors with warnings
+		my @warn_sensors; # warning sensors
+		my @crit_sensors; # critical sensors
+		my @unknown_sensors; # unknown state sensors
 		my $perf = '';#performance sensor
 		my $curr_fans = 0;
 		foreach my $row ( @ipmioutput2 ){
+			my $perf_data;	
 			if( $zenoss ){
 				$row->{'name'} =~ s/ /_/g;
 			}
 			#check for warning sensors
-			if ( $row->{'state'} ne 'Nominal' && $row->{'state'} ne 'N/A' ){
-				$exit = 1 if $exit < 1;
-				$exit = 2 if $exit < 2 && $row->{'state'} ne 'Warning';
-				#don't insert a , the first time
-				$w_sensors .= ", " unless $w_sensors eq '';
-				$w_sensors .= "$row->{'name'} = $row->{'state'}";
-				if( $verbosity ){
-					if( $row->{'reading'} ne 'N/A'){
-						$w_sensors .= " ($row->{'reading'})" ;
-					}
-					else{
-						$w_sensors .= " ($row->{'event'})";
-					}
+			my $unit;
+			my $tmpexit = 3;
+			my $isnum = (($row->{'reading'} =~ /^$PAT_INT$/) || ($row->{'reading'} =~ /^$PAT_FLOAT$/));
+			$unit = $row->{'units'} if ($row->{'units'} ne "N/A");
+			if ($isnum){ # numeric sensor
+				my $idx = get_sensor_idx(\@ipmi_ilist,$row->{'id'}); # Index for lookup of given sensor values
+				my ($warn, $crit,$smin,$smax);
+				# fetching given ranges and max/min
+				if (defined $idx){
+					$warn = interpret_range($wlist[$idx]) if (defined $wlist[$idx]);
+					$crit = interpret_range($clist[$idx]) if (defined $clist[$idx]);
+					$smin = $minlist[$idx] if (defined $minlist[$idx]);
+					$smax = $maxlist[$idx] if (defined $maxlist[$idx]);
 				}
-			}
-			if ( $row->{'units'} ne 'N/A' ){
-				my $val = $row->{'reading'};
-				my $perf_data;
-				my $perf_thresholds;
-				if($zenoss){
+				# getting ipmi ranges if they exist and ranges not given in arguments
+				$warn = interpret_ipmi_range($row->{'lowerNC'},$row->{'upperNC'}) if ((!defined $warn) && ($use_thresholds));
+				$crit = interpret_ipmi_range($row->{'lowerC'},$row->{'upperC'}) if ((!defined $crit) && ($use_thresholds));
+				# evaluating if within thresholds if we have any ranges
+				if ((defined $warn) || (defined $crit)){
+					if ((defined $crit) && (!in_range($crit,$row->{'reading'}))){ $tmpexit = 2;}
+					elsif ((defined $warn) && (!in_range($warn,$row->{'reading'}))){ $tmpexit = 1;}
+					else {$tmpexit = 0;}
+				}
+				# falling back to IPMI evaluation
+				else{
+					$tmpexit = interpret_ipmi_state($row->{'state'})->{'exit'} ;
+				}
+				# generate performance data	
+				my $val;
+				if ($row->{'reading'} ne "N/A") { $val = $row->{'reading'};}
+				else{ $val = $row->{'event'};}
+				if ($zenoss){
 					$perf_data = $row->{'name'}."=".$val;
 				}
 				else{
 					$perf_data = "'".$row->{'name'}."'=".$val;
-				}
-				if($use_thresholds && !$no_thresholds){
-					if(($row->{'lowerNC'} ne 'N/A') && ($row->{'upperNC'} ne 'N/A')){
-						$perf_thresholds = $row->{'lowerNC'}.":".$row->{'upperNC'}.";";
-					}
-					elsif(($row->{'lowerNC'} ne 'N/A') && ($row->{'upperNC'} eq 'N/A')){
-						$perf_thresholds = $row->{'lowerNC'}.":;";
-					}
-					elsif(($row->{'lowerNC'} eq 'N/A') && ($row->{'upperNC'} ne 'N/A')){
-						$perf_thresholds = "~:".$row->{'upperNC'}.";";
-					}
-					elsif(($row->{'lowerNC'} eq 'N/A') && ($row->{'upperNC'} eq 'N/A')){
-						$perf_thresholds = ";";
-					}
-					if(($row->{'lowerC'} ne 'N/A') && ($row->{'upperC'} ne 'N/A')){
-						$perf_thresholds .= $row->{'lowerC'}.":".$row->{'upperC'};
-					}
-					elsif(($row->{'lowerC'} ne 'N/A') && ($row->{'upperC'} eq 'N/A')){
-						$perf_thresholds .= $row->{'lowerC'}.":";
-					}
-					elsif(($row->{'lowerC'} eq 'N/A') && ($row->{'upperC'} ne 'N/A')){
-						$perf_thresholds .= "~:".$row->{'upperC'};
-					}
-					# Add thresholds to performance data
-					if(($row->{'lowerNC'} ne 'N/A') || ($row->{'upperNC'} ne 'N/A') ||
-					($row->{'lowerC'} ne 'N/A') || ($row->{'upperC'} ne 'N/A')){
-						$perf_data .= ";".$perf_thresholds;
-					}
-				}
-				$perf .= $perf_data." ";
+				}				
+				$perf_data .= "[".$unit."]" if (defined $unit); # is this a correct way to report units for zenoss?
+				if (!$no_thresholds){
+					if (defined $warn){ $perf_data .= ";".range2txt($warn);}
+					elsif ((defined $crit) || (defined $smin) || (defined $smax)){ $perf_data .= ";";}
+					if (defined $crit){ $perf_data .= ";".range2txt($crit);}
+					elsif ((defined $smin) || (defined $smax)){ $perf_data .= ";";}
+					if (defined $smin){ $perf_data .= ";".$smin;}
+					elsif (defined $smax){ $perf_data .= ";";}
+					if (defined $smax){ $perf_data .= ";".$smax}
+				}		
 			}
+			else{ # nonnumeric sensor
+				# IPMI evaluation
+				$tmpexit = interpret_ipmi_state($row->{'state'})->{'exit'};
+				# generate performance data	
+				my $val;
+				if ($row->{'reading'} ne "N/A") { $val = $row->{'reading'};}
+				else{ $val = $row->{'event'};}
+				if ($zenoss){
+					$perf_data = $row->{'name'}."=".$val;
+				}
+				else{
+					$perf_data = "'".$row->{'name'}."'=".$val;
+				}				
+			}
+			$perf .= $perf_data." ";
+			# Store sensor evaluation for presentation
+			my $tmpstr;
+			if ($verbosity){ 
+				if ($row->{'reading'} ne 'N/A'){ $tmpstr = " (".$row->{'reading'}.")";}
+				else{ $tmpstr = " (".$row->{'event'}.")";}
+			}
+			else{ $tmpstr = "";}
+			
+			if ($tmpexit == 1){ # Warning
+					push @warn_sensors, $row->{'name'}." = Warning".$tmpstr; 
+			}
+			elsif ($tmpexit == 2){ # Critical
+				push @crit_sensors, $row->{'name'}." = Critical".$tmpstr; 
+			}
+			elsif ($tmpexit == 3){ # Unknown state
+				push @unknown_sensors, $row->{'name'}." = Unknown".$tmpstr; 
+			}	
+			$exit = $tmpexit if ($exit < $tmpexit);			
 			if( $row->{'type'} eq 'Fan' && $row->{'reading'} ne 'N/A' ){
 				$curr_fans++;
 			}
 		}
 		foreach my $row (@{$seloutput}){
+			my $tmpexit = 3;
 			if( $zenoss ){
 				$row->{'name'} =~ s/ /_/g;
 			}
-			if ($row->{'state'} ne 'Nominal'){
-				$exit = 1 if $exit < 1;
-				$exit = 2 if $exit < 2 && $row->{'state'} ne 'Warning';
-				$w_sensors .= ", " unless $w_sensors eq '';
-				$w_sensors .= "$row->{'name'} = $row->{'state'}";
-				if( $verbosity ){
-					if(defined($row->{'type'})){
-						$w_sensors .= " ($row->{'type'})" ;
-					}
+			$tmpexit = interpret_ipmi_state($row->{'state'})->{'exit'};
+			if ($tmpexit){
+				my $tmpstr;
+				if (($verbosity) && (defined($row->{'type'}))){ 
+					$tmpstr = " (".$row->{'type'}.")";
 				}
-			}
+				else{ $tmpstr = "";}
+				
+				if ($tmpexit == 1){ # Warning
+						push @warn_sensors, $row->{'name'}." = ".$row->{'state'}.$tmpstr; 
+				}
+				elsif ($tmpexit == 2){ # Critical
+					push @crit_sensors, $row->{'name'}." = ".$row->{'state'}.$tmpstr; 
+				}
+				elsif ($tmpexit == 3){ # Unknown state
+					push @unknown_sensors, $row->{'name'}." = ".$row->{'state'}.$tmpstr; 
+				}	
+				$exit = $tmpexit if ($exit < $tmpexit);
+			}			
 		}
 		#now check if num fans equals desired unit fans
 		if( $fan_count ){
 			if( $curr_fans < $fan_count ){
 				$exit = 1 if $exit < 1;
-				$w_sensors .= ", " unless $w_sensors eq '';
-				$w_sensors .= "Fan = Warning";
-				if( $verbosity ){
-					$w_sensors .= " ($curr_fans)" ;
-				}
+				if ($verbosity){ push @warn_sensors, "Fan count = Warning ($curr_fans)";}
+				else{ push @warn_sensors, "Fan count = Warning";}
 			}
 		}
 		#check for the FRU serial number
@@ -751,20 +1005,39 @@ MAIN: {
 				$serial_number = $1;
 			}
 		}
-		$perf = substr($perf, 0, -1);#cut off the last chars
-		if ( $exit == 0 ){
+		$perf = substr($perf, 0, -1);#cut off the last char
+		if (@ipmi_ilist == 1){ # single sensor output
+			my $row =$ipmioutput2[0];
+			print interpret_ipmi_state($row->{'state'})->{'state'}," = ";
+			if ($row->{'reading'} ne "N/A"){
+				print $row->{'reading'};
+				if ($row->{'units'} ne "N/A"){
+					print " ",$row->{'units'};
+				}
+			}
+			else{
+				print $row->{'event'};
+			}
+		}
+		elsif ( $exit == 0 ){
 			print "OK";
 		}
 		elsif ( $exit == 1 ){
-			print "Warning [$w_sensors]";
+			print "Warning [".join(", ",@warn_sensors)."]";
+		}
+		elsif ($exit == 2){			
+			print "Critical [".join(", ",@crit_sensors)."]";
+			print " Warning [".join(", ",@warn_sensors)."]" if (@warn_sensors);
 		}
 		else{
-			print "Critical [$w_sensors]";
+			print "Unknown status [".join(", ",@unknown_sensors)."]";
+			print " Critical [".join(", ",@crit_sensors)."]" if (@crit_sensors);
+			print " Warning [".join(", ",@warn_sensors)."]" if (@warn_sensors);
 		}
 		if( $use_fru && defined($serial_number)){
 			print " ($serial_number)";
 		}
-		print " | ", $perf if $perf ne '';
+		print "|", $perf if $perf ne '';
 		print "\n";
 
 		if ( $verbosity > 1 ){
